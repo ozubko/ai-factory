@@ -1,0 +1,8 @@
+Issue 01 (walking skeleton) is complete. The code from the prior session was correct; this session's job was just to run the deferred bootstrap and verification, which the sandbox had blocked:
+
+- `git init` + initial commit (workspace is now git-initialised)
+- `pip install -e ".[dev]"` — zero runtime deps, installs cleanly
+- `pytest tests/` — 63 passed (including the 3 walking-skeleton-specific tests)
+- Manual smoke test of `ai-factory run . "demo task" --backend fake` — exit 0, `factory/<run-id>` branch + out-of-tree worktree created, target repo left untouched, all artifacts (`metadata.json`, `diff.patch`, `changed-files.txt`, `report.md`) present with a pinned base SHA
+
+Updated `issues/01-walking-skeleton.md` status to `done` and appended a Comments entry. No code changes were needed.

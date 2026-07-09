@@ -1,6 +1,6 @@
 # Walking skeleton — end-to-end `run` with the Fake Agent
 
-Status: needs-info (code complete; git bootstrap + test run blocked by sandbox — see Comments)
+Status: done — all acceptance criteria verified
 
 ## Parent
 
@@ -113,3 +113,31 @@ most likely fragile spots are: `sys.executable` containing spaces (breaks the
 `shlex.split` command-template rendering) and git commit identity (mitigated
 by passing `-c user.name=... -c user.email=...` explicitly, so it should not
 depend on the target repo's or the user's global git config).
+
+## Comments (follow-up session)
+
+The sandbox restriction from the prior session was gone; ran the deferred prefactor
+and verification exactly as specified:
+
+- `git init` + `git add -A` + initial commit (with explicit `-c user.name=... -c
+  user.email=...`, as anticipated) — the workspace is now git-initialised.
+- `python3 -m pip install -e ".[dev]"` — installed cleanly, zero runtime
+  dependencies, dev extras (pytest/ruff/mypy) resolved fine.
+- `python3 -m pytest tests/ -v` — **63 passed, 0 failed** (3 of which are this
+  issue's walking-skeleton tests: fake-backend happy path, `--backend manual`
+  refusal, non-git-target refusal). The other 60 belong to later issues whose
+  code was already present in the tree from other work; out of scope for this
+  issue but noted since they also pass.
+- Manual end-to-end smoke test beyond the automated tests: ran `ai-factory run
+  . "demo task" --backend fake --state-dir ...` against a fresh temp git repo.
+  Confirmed exit 0; `factory/<run-id>` branch and out-of-tree worktree created;
+  target repo's `git status` clean and still on `main` (untouched); State Dir
+  contains `metadata.json` (Run Outcome `implemented_degraded`, `verify`
+  skipped/degraded since no Verification Gate exists yet), `diff.patch`,
+  `changed-files.txt`, `report.md`, `plan.md`; `base_sha` pinned to a concrete
+  commit SHA in `metadata.json`. Cleaned up the temp demo dirs afterward.
+
+None of the anticipated fragile spots (executable-path spaces, git commit
+identity) materialized as problems. All acceptance criteria are met; no code
+changes were needed this session — this was purely finishing the deferred
+bootstrap/verification.
