@@ -65,25 +65,6 @@ def test_run_with_fake_backend_produces_expected_artifacts(git_repo: Path, tmp_p
     assert (worktree_path / "FAKE_AGENT_CHANGE.md").exists()
 
 
-def test_manual_backend_is_not_yet_implemented(git_repo: Path, tmp_path: Path) -> None:
-    state_dir = tmp_path / "state"
-
-    exit_code = main(
-        [
-            "run",
-            str(git_repo),
-            "some task",
-            "--backend",
-            "manual",
-            "--state-dir",
-            str(state_dir),
-        ]
-    )
-
-    assert exit_code == 1
-    assert not (state_dir / "runs").exists()
-
-
 def test_run_refuses_on_non_git_target(tmp_path: Path) -> None:
     target = tmp_path / "not-a-repo"
     target.mkdir()

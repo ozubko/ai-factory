@@ -152,6 +152,15 @@ implementation — auto-continues only for low risk, otherwise pauses after
 `plan.md` (overridable with `--force-implement`).
 _Avoid_: approval gate, checkpoint
 
+**Resume**:
+`ai-factory resume <run-id>` re-enters an interrupted Run at its last
+incomplete Phase from persisted `metadata.json` — phase-granular, with no
+mid-phase checkpointing. Refuses to re-run a partial read-write Phase
+(`implement`/`fix`) until `--discard-phase-changes` resets only the
+factory-owned worktree to the Phase's last committed state; read-only Phases
+(`review`) are idempotent to resume.
+_Avoid_: retry, restart, replay
+
 **Base Ref**:
 The commit an automation run branches from and diffs against; defaults to `HEAD`.
 _Avoid_: baseline, parent

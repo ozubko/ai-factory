@@ -95,6 +95,17 @@ def uncommitted_changed_files(worktree_path: Path) -> list[str]:
     return [line for line in result.stdout.splitlines() if line.strip()]
 
 
+def reset_worktree_to_head(worktree_path: Path) -> None:
+    """Resets a factory-owned worktree to its last commit, discarding any
+    uncommitted changes an interrupted read-write Phase left behind
+    (`ai-factory resume --discard-phase-changes`, CONTEXT.md: Resume).
+    Operates only inside `worktree_path` -- a directory physically separate
+    from the target's main working tree -- so the target checkout is never
+    touched (ADR-0002)."""
+    _run(["reset", "--hard", "HEAD"], cwd=worktree_path)
+    _run(["clean", "-fd"], cwd=worktree_path)
+
+
 def branch_exists(target_repo: Path, branch: str) -> bool:
     """`git branch --list` prefixes the checked-out-here branch with `* ` and a
     branch checked out in another linked worktree with `+ ` — strip either."""

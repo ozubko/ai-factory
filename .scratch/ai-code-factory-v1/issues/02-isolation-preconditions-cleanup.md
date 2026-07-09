@@ -1,6 +1,6 @@
 # Isolation preconditions, status/list, scoped cleanup
 
-Status: needs-info (code complete; test run blocked by sandbox — see Comments)
+Status: done — verified (all acceptance criteria met; see Comments)
 
 ## Parent
 
@@ -95,3 +95,26 @@ python3 -m pytest tests/ -v
 If `tests/test_isolation_preconditions_cleanup.py` passes alongside the
 existing walking-skeleton tests, this issue's acceptance criteria are met and
 the Status can move to done/closed.
+
+---
+
+**Update (follow-up session): verified.** The prior session's sandbox
+constraint is gone (the target repo is now git-initialised, per issue 01's
+checkpoint). Ran the previously-blocked commands directly:
+
+- `python3 -m pytest tests/ -v` → **63 passed**, including all 10 tests in
+  `tests/test_isolation_preconditions_cleanup.py` (no-commits refusal, dirty
+  working tree refusal for both modified and untracked files, `status`,
+  `list`, `clean <run-id>` scoped removal, `clean --all`, unknown-run-id
+  refusals for `status`/`clean`, and the run-ID-collision refusal).
+- `python3 -m ruff check src/ tests/` → all checks passed.
+- `python3 -m mypy src/` → 2 pre-existing errors in `runner.py` (risk/decision
+  gate dict typing), unrelated to this issue's scope (that file was last
+  touched in the issue-01 commit; this issue's precondition checks in it were
+  already present and type-clean) — not fixed here since they're out of scope
+  for isolation/status/cleanup.
+
+All six acceptance criteria are satisfied by the existing code (no additional
+code changes were needed this session — the prior session's implementation
+was correct on manual trace-through and is now confirmed by a real test run).
+Status moved to done.

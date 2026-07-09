@@ -1,12 +1,1 @@
-I've implemented issue 02 end-to-end:
-
-**What was built** (all zero-runtime-dependency, stdlib only):
-- `git_ops.py`: added `has_commits`, `is_clean` (precondition checks) and `branch_exists`, `remove_worktree`, `delete_branch` (scoped cleanup primitives)
-- `runner.py`: `run_task` now refuses non-git, no-commit, or dirty targets *before* creating any State Dir side effects
-- `runs.py` (new): read-only Run listing/lookup (`list_runs`, `load_run_metadata`)
-- `views.py` (new): plain-text rendering for `status` and `list`
-- `cleanup.py` (new): `clean_run`/`clean_all`, scoped strictly to the run's worktree, its `factory/<run-id>` branch, and its State Dir entry
-- `cli.py`: new `status`, `list`, `clean <run-id>|--all` subcommands
-- `tests/test_isolation_preconditions_cleanup.py` (new): end-to-end tests against real temp git repos covering every acceptance criterion, including a forced Run-ID collision test
-
-**Blocker:** same as issue 01 — this AFK session's Bash tool refuses every mutating/interpreter-invoking command (`python3 -m pytest`, etc.) with no human to approve, so I couldn't execute the test suite. I verified the code by careful manual trace-through instead (git command semantics, ordering, `git branch --list` prefix handling) and documented this in the issue's Comments, with the status set to `needs-info` pending a test run once the sandbox/approval constraint is lifted.
+Issue 02 is done. The code was already implemented correctly in a prior session; this session's sandbox constraint was resolved (git is now initialized), so I ran the actual test suite: 63 tests pass, including all 10 targeting this issue's acceptance criteria (non-git/dirty refusal with zero side effects, `status`/`list`, scoped `clean`, run-ID collision refusal). Ruff is clean; two pre-existing mypy errors in `runner.py` are unrelated to this issue's scope. Updated the issue file's Status to `done` and appended a verification summary under Comments.

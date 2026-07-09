@@ -39,20 +39,34 @@ def main(argv: list[str] | None = None) -> int:
             "detection can be exercised end-to-end."
         ),
     )
+    parser.add_argument(
+        "--mutate-readonly-phase",
+        default=None,
+        help=(
+            "Restrict --mutate-readonly to this phase only (e.g. 'review'), so "
+            "a single read-only Phase's Contract Violation path can be "
+            "exercised in isolation. Default: mutate any read-only phase."
+        ),
+    )
     args = parser.parse_args(argv)
+
+    def _should_mutate() -> bool:
+        if not args.mutate_readonly:
+            return False
+        return args.mutate_readonly_phase in (None, args.phase)
 
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     if args.phase == "plan":
         output_path.write_text(_FAKE_PLAN_MD)
-        if args.mutate_readonly:
+        if _should_mutate():
             Path("FAKE_AGENT_PLAN_VIOLATION.md").write_text(
                 "Fake Agent violated the read-only plan Phase contract.\n"
             )
         summary = "Fake Agent wrote a contract-compliant plan.md."
     elif args.phase == "review":
-        if args.mutate_readonly:
+        if _should_mutate():
             Path("FAKE_AGENT_REVIEW_VIOLATION.md").write_text(
                 "Fake Agent violated the read-only review Phase contract.\n"
             )

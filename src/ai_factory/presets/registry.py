@@ -17,4 +17,12 @@ PRESETS: dict[str, str] = {
         "{python} -m ai_factory.presets.fake_agent "
         "--phase {phase} --output {output_path} --mutate-readonly"
     ),
+    # Test-only preset: like `fake-readonly-violator`, but scoped to the
+    # `review` Phase only, so the Diff Review Contract Violation path can be
+    # exercised without the `plan` Phase halting the Run first.
+    "fake-review-violator": (
+        "{python} -m ai_factory.presets.fake_agent "
+        "--phase {phase} --output {output_path} "
+        "--mutate-readonly --mutate-readonly-phase review"
+    ),
 }

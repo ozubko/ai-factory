@@ -1,6 +1,6 @@
 # Planning Phase + prompt assembly + read-only enforcement
 
-Status: needs-info (code complete; test run blocked by sandbox — see Comments)
+Status: done
 
 ## Parent
 
@@ -147,3 +147,20 @@ python3 -m pytest tests/ -v
 If the full suite passes (`tests/test_planning_phase.py` especially, plus the
 two touched-up cases in `tests/test_verification_gate_fix_loop.py`), this
 issue's acceptance criteria are met and the Status can move to done/closed.
+
+**Update — verified this session.** The repo now has a working tree (issue 01's
+`git init` landed in commit `689388e`), so the environment constraint above no
+longer applies. Ran the checklist:
+
+- `python3 -m pytest tests/ -q` → **63 passed**, including all 7 tests in
+  `tests/test_planning_phase.py` (plan headings present, missing-headings
+  degraded check, three bundle files per phase with verbatim system+user
+  content in `combined`, committed-secret redaction in `plan-user.md`,
+  `--backend fake-readonly-violator` → `contract_violation` + saved evidence +
+  halt before `implement`/`verify`, and the two direct determinism unit tests
+  for `prompt_builder.build_user_prompt` / `safety.redact_secrets`).
+- `python3 -m mypy src/ai_factory` → no issues (23 source files).
+- `python3 -m ruff check src/ai_factory tests` → all checks passed.
+
+No code changes were needed — the implementation from the prior session was
+correct as written. All acceptance criteria are met. Status moved to `done`.

@@ -1,0 +1,9 @@
+Issue 10 (Resume + partial-change safety) is implemented and verified end-to-end:
+
+- **`ai-factory resume <run-id>`** reads persisted `metadata.json`, finds the last incomplete Phase, and continues via the same `implement`/`review` pipelines staged driving already uses (extracted into shared `_continue_implement`/`_continue_review` helpers).
+- Resuming a partial `implement`/`fix` Phase refuses if the factory worktree is dirty, explaining the worktree path and `--discard-phase-changes`.
+- `--discard-phase-changes` resets only the factory worktree (`git reset --hard HEAD` + `git clean -fd`, new `git_ops.reset_worktree_to_head`) — verified the target repo's own working tree stays untouched.
+- Resuming the read-only `review` Phase is unconditionally idempotent (auto-discards any leftover dirt, no flag needed).
+- Terminal/halted/missing-state runs refuse with a clear "nothing to resume" message.
+
+Added a `Resume` glossary entry to `CONTEXT.md`, wrote `tests/test_resume_partial_change_safety.py`, and confirmed the full suite (118 tests), ruff, and mypy all pass. Manually exercised both the refuse-then-discard flow and the plan→resume→implement flow against a real temp git repo. Issue status updated to `done` with a summary under `## Comments`.

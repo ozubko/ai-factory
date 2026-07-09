@@ -1,6 +1,6 @@
 # Factory-owned Verification Gate + bounded Fix Loop + Command Deny-list
 
-Status: needs-info (code complete; test run blocked by sandbox — see Comments)
+Status: done (verified — see Comments)
 
 ## Parent
 
@@ -111,3 +111,32 @@ python3 -m pytest tests/ -v
 before relying on this slice, especially `tests/test_verification_gate_fix_loop.py`
 (the Makefile-recipe-based Fix Loop scenarios are the most likely spot for an
 environment-specific surprise, e.g. if `/bin/sh` or `make` behaves unexpectedly).
+
+## Follow-up (this session): sandbox unblocked, verified, mypy fixed
+
+The prior session's sandbox limitation (every `python`/`pytest` invocation needing
+approval with no human present) did not reproduce in this session — `pytest`, `ruff`,
+and `mypy` all ran directly.
+
+- `.venv/bin/python -m pytest tests/ -v` → **63 passed**, including all 6 tests in
+  `tests/test_verification_gate_fix_loop.py` and the boundary tests in
+  `tests/test_verify.py` / `tests/test_safety.py`. Confirms every acceptance
+  criterion: passing gate → `implemented_verified`; exhausted Fix Loop →
+  `implemented_unverified`; no detected commands → `implemented_degraded` (not
+  refused); Fix Loop bounded to `max_fix_attempts` with no broad rewrite (only a
+  targeted fix prompt with the failing command's log tail); a deny-listed
+  verification command refuses the Run with nothing executed; `summary` (agent
+  claim) and `verify` (factory-verified) stay in visibly separate `metadata.json`
+  fields.
+- `ruff check src/ tests/` → clean.
+- `mypy src/` → found 2 real type errors in `src/ai_factory/runner.py` (an
+  implicitly-typed `gate_info` dict whose inferred type mypy narrowed
+  inconsistently between its two definitions across the halted-plan branch and the
+  normal branch, since `"reason"` holds `str | None` while the other keys hold
+  `bool`/`None`). Fixed by annotating the first definition as `dict[str, Any]`
+  (the second, unannotated `gate_info = {...}` reuses that type); added
+  `from typing import Any`. Re-ran `pytest`/`ruff`/`mypy` after the fix — all
+  clean, 63 passed.
+
+No other code changes were needed; the verification gate, fix loop, and deny-list
+implementation from the prior session was correct as written.

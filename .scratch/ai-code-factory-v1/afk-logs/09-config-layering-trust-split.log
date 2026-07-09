@@ -1,0 +1,9 @@
+Issue 09 (config layering + trust split + backend selection) is implemented and verified:
+
+- New `src/ai_factory/config.py`: layered config resolution (CLI > repo `factory.toml` > user `config.toml` > built-in defaults) for backend name and verification commands, with the repo-vs-user trust split enforced — repo config can only select a backend by name and is rejected (`ConfigError`) if it tries to define a command template/preset.
+- Wired into `runner.py` (all five entry points: `run_manual`, `plan_task`, `implement_task`, `review_task`, `run_task`), replacing the static `PRESETS` registry with the resolved, possibly user-extended preset set, and layering repo/user commands onto the detected Repo Profile (recorded with `source: repo_config`/`config_path`), still flowing through the existing deny-list-checked Verification Gate.
+- `cli.py`'s `--backend` now defaults to `None` on `run` so config layers apply; `plan` keeps its required explicit backend.
+- Added `tests/test_config_layering_trust_split.py` (6 tests: precedence, command layering, template rejection, end-to-end repo-config command + deny-list refusal, state-dir env redirection) and updated one pre-existing test whose assumption (fixed argparse `choices`) no longer holds now that presets are dynamic.
+- Full suite: 112 passed; `ruff` and `mypy` clean.
+
+Status and a detailed summary were appended to `.scratch/ai-code-factory-v1/issues/09-config-layering-trust-split.md`.

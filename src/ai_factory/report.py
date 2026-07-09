@@ -66,6 +66,24 @@ def _format_plan_body(phase: dict) -> list[str]:
     return lines
 
 
+def _format_review_body(phase: dict) -> list[str]:
+    status = phase.get("status")
+    if status == "skipped":
+        return [f"- skipped: {phase.get('reason') or 'n/a'}"]
+    if status == "not_executed":
+        return [f"- not executed: {phase.get('reason') or 'n/a'}"]
+    if status == "contract_violation":
+        return [
+            "- **Contract Violation:** this read-only Phase modified the "
+            "worktree; evidence saved to `contract-violation.patch`",
+        ]
+    if status == "failed":
+        return [f"- (review phase failed: {phase.get('reason') or 'n/a'})"]
+    lines = [f"- summary: {phase.get('summary') or 'n/a'}", "", "Findings:", ""]
+    lines.append(phase.get("findings") or "(no findings captured)")
+    return lines
+
+
 def _format_fix_attempts(attempts: list[dict]) -> list[str]:
     lines: list[str] = []
     for attempt in attempts:
@@ -88,6 +106,7 @@ def render_report(metadata: dict) -> str:
     verify_phase = phases.get("verify", {})
     summary = implement_phase.get("summary") or "(no summary captured)"
     fix_attempts = (metadata.get("fix_loop") or {}).get("attempts") or []
+    review_phase = phases.get("review", {})
     risk = metadata.get("risk") or {}
     gate = metadata.get("decision_gate") or {}
 
@@ -130,6 +149,13 @@ def render_report(metadata: dict) -> str:
         ]
 
     lines += [
+        "## Diff Review (opt-in via --review; findings only, not an approval gate)",
+        "",
+        *_format_review_body(review_phase),
+        "",
+    ]
+
+    lines += [
         "## Changed files",
         "",
         "```",
@@ -138,10 +164,20 @@ def render_report(metadata: dict) -> str:
         "",
         "## Next steps",
         "",
-        f"- Inspect the worktree: `cd {metadata['worktree_path']}`",
-        f"- Review the diff: `git -C {metadata['target_repo']} diff "
-        f"{metadata['base_sha']} {metadata['branch']}`",
-        f"- Switch to the branch: `git -C {metadata['target_repo']} switch {metadata['branch']}`",
-        "",
     ]
+    if metadata.get("worktree_path") and metadata.get("branch") and metadata.get("base_sha"):
+        lines += [
+            f"- Inspect the worktree: `cd {metadata['worktree_path']}`",
+            f"- Review the diff: `git -C {metadata['target_repo']} diff "
+            f"{metadata['base_sha']} {metadata['branch']}`",
+            f"- Switch to the branch: `git -C {metadata['target_repo']} switch {metadata['branch']}`",
+        ]
+    else:
+        lines += [
+            "- Manual Mode created no branch or worktree; inspect the Repo "
+            f"Profile and Prompt Bundle prepared under `{metadata['state_dir']}/runs/{metadata['run_id']}/`.",
+            "- Drive phases yourself, or continue with a real backend via "
+            "`ai-factory plan <target> \"<task>\" --backend <name>`.",
+        ]
+    lines.append("")
     return "\n".join(lines)

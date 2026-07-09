@@ -1,6 +1,6 @@
 # Risk-aware lifecycle — deterministic classifier + Decision Gate + flags
 
-Status: ready-for-agent
+Status: done — verified (all acceptance criteria met; see Comments)
 
 ## Parent
 
@@ -42,3 +42,44 @@ Decision-encoding schema (from ADR-0014):
 
 - Issue 03 (`issues/03-profiling-command-detection.md`)
 - Issue 05 (`issues/05-planning-phase-prompts.md`)
+
+## Comments
+
+The deterministic `risk.py` classifier, the `decision_gate.py` Decision Gate,
+the CLI flags (`--pause-after-plan`, `--auto`, `--force-implement`, `--risk`),
+and the `runner.py` wiring (pre-plan classification -> plan Phase ->
+post-plan re-classification with plan-predicted files -> Decision Gate ->
+implement/verify or pause) were already present in the working tree
+(from `src/ai_factory/{risk,decision_gate,runner,cli,report,prompts}.py`),
+including `## 12. Risk Assessment` in the plan contract and the Risk
+Assessment section leading `report.md`, but had **zero test coverage** — this
+session added `tests/test_risk_aware_lifecycle.py` (20 tests) to lock in and
+verify every acceptance criterion:
+
+- `risk.classify()` tested directly as a pure function: low/medium/high per
+  domain (auth_authz, broad_refactor, db_migrations via predicted files),
+  determinism (same inputs -> same result), and the weak-verification bump
+  (only when a risky domain is already matched; a domain-free task stays
+  `low` even with no verification commands).
+- `decision_gate.decide()` tested directly: low auto-continues; medium/high
+  pause by default; `--pause-after-plan` always pauses (even low risk);
+  `--force-implement` overrides medium/high (recorded); `--auto` does **not**
+  override medium/high.
+- End-to-end via the CLI against real temp git repos + the Fake Agent:
+  low-risk task auto-continues through implement/verify to
+  `implemented_verified`/`implemented_degraded`; a high-risk task (OAuth
+  login) pauses after `plan.md` with outcome `planned` and a risk-gated
+  `outcome_reason`, `implement`/`verify` left `not_executed`;
+  `--pause-after-plan` pauses a low-risk task; `--force-implement` continues
+  a high-risk task and records `force_implement_used`; `--auto` does not
+  unpause a high-risk task; `--risk high` override is honored with
+  `overridden_by_user: true`; an invalid `--risk` value is refused by
+  argparse; `risk{}` is present with the full decision-encoding schema on
+  every run.
+
+Full suite: `pytest` — 83 passed (63 pre-existing + 20 new). `ruff check` and
+`mypy src` both clean. Only issue 06's own acceptance criteria were touched;
+no other issues were started. The `--auto` open question from the handoff
+was left as specified in the PRD/ADR-0014 (explicit form of the
+classifier-gated default; does not override medium/high) — no flip was
+needed or made.

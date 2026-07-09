@@ -1,6 +1,6 @@
 # Profiling + deterministic command detection + secret redaction
 
-Status: implemented
+Status: done — verified (all acceptance criteria met; see Comments)
 
 ## Parent
 
@@ -69,11 +69,30 @@ degraded mode, instruction discovery + truncation, secret presence-only recordin
 ignored-directory skipping, same-repo-same-result determinism, and the `profile`
 CLI command (success + non-directory target refusal).
 
-**Caveat:** this AFK session's sandbox required approval for every `python3`/test
-invocation (and for mutating `git` commands), and no human was present to grant it
-— confirmed via both direct Bash calls and a dispatched subagent, both denied
-identically. I could not execute `pytest` to confirm the suite passes. I instead
-hand-traced `build_profile()`/`detect_ecosystem()` against each test's fixture and
-assertions line-by-line and am confident in correctness, but this should be
-spot-checked by running `python3 -m pytest tests/test_profiling.py -v` in an
-environment where that's permitted, before relying on this slice.
+**Update (follow-up session): verified.** The prior session's sandbox
+constraint is gone (`python3`/`pytest` run without an approval block). Ran the
+previously-blocked commands directly:
+
+- `python3 -m pytest tests/test_profiling.py -v` → **11 passed**, one per
+  acceptance criterion (Python declared+inferred commands, tox precedence over
+  inferred pytest, Node declared scripts, Makefile fallback, unknown-ecosystem
+  degraded/no-crash, instruction discovery + truncation, secret presence-only
+  recording, ignored-directory skipping, same-repo determinism, and the
+  `profile` CLI success/refusal paths).
+- `python3 -m pytest tests/ -v` → **63 passed** (full suite, no regressions).
+- `python3 -m ruff check src/ tests/` → all checks passed.
+- `python3 -m mypy src/` → 2 pre-existing errors in `runner.py` (risk/decision
+  gate dict typing), unrelated to this issue's scope — same errors already
+  flagged and left out-of-scope during issue 02's verification.
+- Live smoke test: ran `ai-factory profile .` against this repo itself.
+  Output showed `ecosystem: "python"`, `degraded: false`, `install`/`test`/
+  `build` commands each tagged `source: "inferred"` + a `confidence`,
+  `AGENTS.md` discovered and labeled by path with `truncated: false`, and
+  `secrets_detected: []` / `secret_values_included: false` — no secret file
+  exists in this repo, and the code path that would record one never opens
+  file contents, so no value could leak either way.
+
+All six acceptance criteria are satisfied by the existing implementation (no
+code changes were needed this session — the prior session's hand-traced
+implementation was correct and is now confirmed by a real test run and a live
+CLI smoke test). Status moved to done.

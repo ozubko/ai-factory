@@ -8,8 +8,9 @@ import sys
 from pathlib import Path
 
 from . import cleanup, runs, views
+from .presets.registry import PRESETS
 from .profiling import build_profile
-from .runner import RunError, run_task
+from .runner import RunError, implement_task, plan_task, resume_task, review_task, run_task
 from .state_dir import resolve_state_dir
 
 
@@ -22,9 +23,12 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("task", help="The task description.")
     run_parser.add_argument(
         "--backend",
-        required=True,
-        choices=["fake", "fake-readonly-violator", "manual"],
-        help="AgentBackend preset to use for this Run.",
+        default=None,
+        help=(
+            "AgentBackend preset to use for this Run. Overrides repo/user config "
+            "(precedence: --backend > repo factory.toml > user config > 'manual'); "
+            "'manual' makes no model call and creates no git refs."
+        ),
     )
     run_parser.add_argument(
         "--state-dir",
@@ -55,11 +59,100 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Override the computed Risk Level for this Run (sets overridden_by_user).",
     )
+    run_parser.add_argument(
+        "--review",
+        action="store_true",
+        help=(
+            "Run the read-only Diff Review Phase after implementation and feed its "
+            "findings into report.md. Never an approval gate and never changes the "
+            "Run's outcome."
+        ),
+    )
 
     profile_parser = subparsers.add_parser(
         "profile", help="Detect and print the Repo Profile for a Target Repo (no Run is created)."
     )
     profile_parser.add_argument("target", help="Path to the Target Repo.")
+
+    plan_parser = subparsers.add_parser(
+        "plan",
+        help=(
+            "Staged driving: create a Run and run only the `plan` Phase, then "
+            "stop for human review (continue with `ai-factory implement <run-id>`)."
+        ),
+    )
+    plan_parser.add_argument("target", help="Path to the Target Repo.")
+    plan_parser.add_argument("task", help="The task description.")
+    plan_parser.add_argument(
+        "--backend",
+        required=True,
+        help=(
+            "AgentBackend preset to use for this Run (Manual Mode cannot drive "
+            "staged phases). Built-in presets: " + ", ".join(sorted(PRESETS)) +
+            "; user config may define additional presets."
+        ),
+    )
+    plan_parser.add_argument(
+        "--state-dir",
+        default=None,
+        help="Override the State Dir (also settable via AI_FACTORY_STATE_DIR).",
+    )
+
+    implement_parser = subparsers.add_parser(
+        "implement",
+        help="Staged driving: continue a Run created by `ai-factory plan` past `implement`/verify/fix-loop.",
+    )
+    implement_parser.add_argument("run_id", help="The Run ID to continue (from `ai-factory plan`).")
+    implement_parser.add_argument(
+        "--state-dir",
+        default=None,
+        help="Override the State Dir (also settable via AI_FACTORY_STATE_DIR).",
+    )
+    implement_parser.add_argument(
+        "--review",
+        action="store_true",
+        help="Also run the read-only Diff Review Phase after implementation.",
+    )
+
+    review_parser = subparsers.add_parser(
+        "review",
+        help="Staged driving: run the read-only Diff Review Phase over a Run whose implement already completed.",
+    )
+    review_parser.add_argument("run_id", help="The Run ID to review.")
+    review_parser.add_argument(
+        "--state-dir",
+        default=None,
+        help="Override the State Dir (also settable via AI_FACTORY_STATE_DIR).",
+    )
+
+    resume_parser = subparsers.add_parser(
+        "resume",
+        help=(
+            "Re-enter an interrupted Run at its last incomplete Phase using "
+            "persisted state."
+        ),
+    )
+    resume_parser.add_argument("run_id", help="The Run ID to resume.")
+    resume_parser.add_argument(
+        "--state-dir",
+        default=None,
+        help="Override the State Dir (also settable via AI_FACTORY_STATE_DIR).",
+    )
+    resume_parser.add_argument(
+        "--discard-phase-changes",
+        action="store_true",
+        help=(
+            "Reset the factory-owned worktree to its last committed state before "
+            "retrying an interrupted read-write Phase (implement/fix), discarding "
+            "any partial changes it left behind. The target checkout is never "
+            "touched."
+        ),
+    )
+    resume_parser.add_argument(
+        "--review",
+        action="store_true",
+        help="Also run the read-only Diff Review Phase if it is the only Phase left to resume.",
+    )
 
     status_parser = subparsers.add_parser("status", help="Show a Run's outcome and Phase statuses.")
     status_parser.add_argument("run_id", help="The Run ID to inspect.")
@@ -107,6 +200,40 @@ def main(argv: list[str] | None = None) -> int:
                 auto=args.auto,
                 force_implement=args.force_implement,
                 risk_override=args.risk,
+                review=args.review,
+            )
+        except RunError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+
+    if args.command == "plan":
+        try:
+            return plan_task(args.target, args.task, args.backend, args.state_dir)
+        except RunError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+
+    if args.command == "implement":
+        try:
+            return implement_task(args.run_id, args.state_dir, review=args.review)
+        except RunError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+
+    if args.command == "review":
+        try:
+            return review_task(args.run_id, args.state_dir)
+        except RunError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+
+    if args.command == "resume":
+        try:
+            return resume_task(
+                args.run_id,
+                args.state_dir,
+                discard_phase_changes=args.discard_phase_changes,
+                review=args.review,
             )
         except RunError as exc:
             print(f"error: {exc}", file=sys.stderr)

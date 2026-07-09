@@ -1,10 +1,1 @@
-Implementation for issue 04 (Verification Gate + Fix Loop + Command Deny-list) is complete:
-
-- **`src/ai_factory/safety.py`** — new Command Deny-list module (`check_command` → `DeniedCommandError` on match).
-- **`src/ai_factory/verify.py`** — new Verification Gate module; deny-checks all commands *before* executing any, runs in `install→lint→typecheck→test→build` order, stops at first failure, `degraded=True` when no commands exist.
-- **`src/ai_factory/runner.py`** — rewired to run the gate after `implement`, then a bounded Fix Loop (default 2 attempts) re-invoking a `fix` phase on failure, producing `implemented_verified` / `implemented_degraded` / `implemented_unverified` / refusal on a deny-listed command.
-- **`src/ai_factory/report.py`** — now shows factory-verified Verification Gate results and Fix Loop attempts distinctly from agent-claimed summaries.
-- **`src/ai_factory/presets/fake_agent.py`** — Fake Agent now has deterministic `fix`-phase behavior so Fix Loop success/exhaustion scenarios are constructible with plain Makefile fixtures.
-- Tests added: `tests/test_safety.py`, `tests/test_verify.py`, `tests/test_verification_gate_fix_loop.py`.
-
-One important caveat: this sandbox blocks all `python`/`pytest` execution (no approval available, confirmed directly and via a subagent) — same limitation prior sessions (issues 01/02) hit. I could not run the test suite, so I hand-traced the logic carefully against every test's fixtures/assertions instead. I set the issue's `Status:` to `needs-info (code complete; test run blocked by sandbox — see Comments)` and documented exactly what should be spot-checked (`python3 -m pytest tests/ -v`), matching the convention already established in issues 01/02.
+Issue 04 is complete: the Verification Gate, bounded Fix Loop, and Command Deny-list implementation from the prior session was correct — all 63 tests pass (including the 6 fix-loop/gate tests and safety/verify boundary tests), ruff is clean. I found and fixed 2 real mypy type errors in `runner.py` (an implicitly-typed `gate_info` dict) that the prior session couldn't catch due to its sandbox block. Status updated to `done` with a Comments entry summarizing the verification and fix.
