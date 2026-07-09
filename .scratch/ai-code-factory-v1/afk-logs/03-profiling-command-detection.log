@@ -1,0 +1,8 @@
+Implementation complete for issue 03 (profiling + deterministic command detection + secret redaction):
+
+- **New module**: `src/ai_factory/profiling.py` — deterministic, stdlib-only Repo Profile builder with an extensible ecosystem registry (Python, Node/TypeScript, Makefile fallback), command detection tagged `source`/`confidence`, Repository Instructions discovery (labeled, size-capped, truncation recorded), and presence-only secret-file detection (`secrets_detected`, `secret_values_included: false` — file contents are never read for the secret check).
+- **CLI**: `ai-factory profile <target>` added to `cli.py`, printing `profile.json` to stdout.
+- **Tests**: `tests/test_profiling.py` covering every acceptance criterion.
+- Updated the issue file's status to `implemented` with a detailed comment.
+
+One caveat worth flagging: this sandboxed AFK session denied every `python3`/pytest invocation (and mutating git commands) requiring approval that no human was present to grant — confirmed via both direct Bash calls and a dispatched subagent. I hand-traced the test suite against the implementation line-by-line instead of executing it, and documented this explicitly in the issue's Comments section so it gets spot-checked (`python3 -m pytest tests/test_profiling.py -v`) before being relied on.

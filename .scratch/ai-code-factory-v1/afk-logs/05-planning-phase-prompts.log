@@ -1,0 +1,12 @@
+Implementation for issue 05 is complete. Summary of what was built:
+
+- **`prompts.py`** — the four static system-prompt assets (plan/implement/fix/review) with the authority hierarchy, plus `PLAN_HEADINGS` (the 11-section plan contract + ADR-0014's Risk Assessment section) and `missing_plan_headings()`.
+- **`prompt_builder.py`** — the deterministic, template-engine-free per-phase user-prompt builder (task + Repo Profile + commands + bounded file tree + secret-redacted Repository Instructions).
+- **`safety.py`** — added `redact_secrets()` for secret-value redaction.
+- **`git_ops.py`** — added `uncommitted_diff()`/`uncommitted_changed_files()` to capture Contract Violation evidence without committing.
+- **`runner.py`** — added the read-only `plan` Phase before `implement`, enforced via git afterwards (violation → `contract_violation` + saved evidence + halt); Repo Profile now built once up front.
+- **`report.py`** — new "Plan" section.
+- **Fake Agent + presets** — deterministic `plan`/`review` behavior, plus a `--mutate-readonly`/`fake-readonly-violator` scenario to exercise Contract Violation end-to-end.
+- **`tests/test_planning_phase.py`** (new) plus small necessary integration fixes to a pre-existing issue-04 test file.
+
+As with every prior session in this thread, the sandbox denied all `git`/`python3` invocations (AFK, no human to approve), so this couldn't be executed — verified instead by careful manual trace-through. Status set to `needs-info` with full details logged in the issue's Comments section for whoever runs the suite next.
