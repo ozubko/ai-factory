@@ -30,6 +30,10 @@ class SubprocessBackend(AgentBackend):
             "user_prompt_path": str(request.user_prompt_path),
             "combined_prompt_path": str(request.combined_prompt_path),
             "output_path": str(request.output_path),
+            # Prompt bundles and output_path live outside the worktree, in the
+            # run directory (ADR-0002/0012) — a real CLI's own directory
+            # sandboxing (e.g. `--add-dir`) needs a path to grant access to.
+            "run_dir": str(request.output_path.parent),
         }
         argv = shlex.split(self.command_template.format(**placeholders))
 
@@ -37,10 +41,19 @@ class SubprocessBackend(AgentBackend):
         stdout_path = self.log_dir / f"{request.phase}.stdout.log"
         stderr_path = self.log_dir / f"{request.phase}.stderr.log"
 
-        with stdout_path.open("w") as out, stderr_path.open("w") as err:
+        # No shell is involved (argv exec only), so a template can't use `<` to
+        # redirect a file into stdin. Pipe the combined prompt directly instead —
+        # this is the only way a CLI that reads its prompt from stdin (rather
+        # than a positional argument) can receive it.
+        with (
+            stdout_path.open("w") as out,
+            stderr_path.open("w") as err,
+            request.combined_prompt_path.open("rb") as prompt_in,
+        ):
             proc = subprocess.run(
                 argv,
                 cwd=request.workdir,
+                stdin=prompt_in,
                 stdout=out,
                 stderr=err,
                 timeout=request.timeout,

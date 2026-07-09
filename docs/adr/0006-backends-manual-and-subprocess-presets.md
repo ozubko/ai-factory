@@ -36,3 +36,12 @@ depend on the user's installed, authenticated CLI and are overridable in config.
 
 v1 uses shell command templates with `{placeholders}`. A future argv-based preset
 format (`argv = [...]` + `stdin_file`) is planned to avoid shell-quoting issues.
+
+**Addendum (adding real `codex`/`claude` presets):** `SubprocessBackend` pipes
+`combined_prompt_path`'s contents to the child process's stdin unconditionally —
+required for CLIs (confirmed: Codex) that read their prompt from stdin rather than
+a positional argument, and harmless for CLIs that ignore stdin. A `run_dir`
+placeholder (`output_path`'s parent — where `bundles/` and phase outputs live,
+outside the worktree) was added so a preset's own directory sandboxing (e.g.
+`--add-dir`) can be granted access to them. Neither addition changes the "plain
+argv, no shell" execution model.
