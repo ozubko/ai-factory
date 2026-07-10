@@ -9,22 +9,33 @@ from __future__ import annotations
 import shlex
 import subprocess
 import sys
+from collections.abc import Mapping, Sequence
 from pathlib import Path
+from typing import Any
 
 from .base import AgentBackend, AgentRequest, AgentResult
+
+PresetSpec = str | Mapping[str, Any]
 
 
 class SubprocessBackend(AgentBackend):
     name = "subprocess"
 
-    def __init__(self, command_template: str, log_dir: Path) -> None:
+    def __init__(self, command_template: PresetSpec, log_dir: Path) -> None:
         self.command_template = command_template
         self.log_dir = log_dir
 
-    def run(self, request: AgentRequest) -> AgentResult:
-        placeholders = {
+    def _placeholders(self, request: AgentRequest) -> dict[str, str]:
+        sandbox_mode = "read-only" if request.mode == "read_only" else "workspace-write"
+        return {
             "python": sys.executable,
             "phase": request.phase,
+            "mode": request.mode,
+            # Backend presets can use this for phase-aware tool sandboxing. For
+            # example, Codex can run plan/review with `read-only` but
+            # implement/fix with `workspace-write`. The Factory still enforces
+            # read-only Phases with git afterwards; this is defense-in-depth.
+            "sandbox_mode": sandbox_mode,
             "workdir": str(request.workdir),
             "system_prompt_path": str(request.system_prompt_path),
             "user_prompt_path": str(request.user_prompt_path),
@@ -35,16 +46,47 @@ class SubprocessBackend(AgentBackend):
             # sandboxing (e.g. `--add-dir`) needs a path to grant access to.
             "run_dir": str(request.output_path.parent),
         }
-        argv = shlex.split(self.command_template.format(**placeholders))
+
+    def _render_argv(self, request: AgentRequest) -> list[str]:
+        placeholders = self._placeholders(request)
+
+        if isinstance(self.command_template, str):
+            # Backward-compatible legacy command-template mode. This remains
+            # useful for simple user config, but paths with spaces are safer in
+            # the structured `argv = [...]` format because each token is rendered
+            # independently and never reparsed by a shell-like splitter.
+            return shlex.split(self.command_template.format(**placeholders))
+
+        argv_value = self.command_template.get("argv")
+        if argv_value is not None:
+            if not isinstance(argv_value, Sequence) or isinstance(argv_value, (str, bytes)):
+                raise TypeError("subprocess preset `argv` must be a list of strings")
+            argv: list[str] = []
+            for token in argv_value:
+                if not isinstance(token, str):
+                    raise TypeError("subprocess preset `argv` must contain only strings")
+                argv.append(token.format(**placeholders))
+            return argv
+
+        command_value = self.command_template.get("command")
+        if isinstance(command_value, str):
+            return shlex.split(command_value.format(**placeholders))
+
+        raise TypeError(
+            "subprocess preset must be either a string, `{argv = [...]}`, or `{command = ...}`"
+        )
+
+    def run(self, request: AgentRequest) -> AgentResult:
+        argv = self._render_argv(request)
 
         self.log_dir.mkdir(parents=True, exist_ok=True)
         stdout_path = self.log_dir / f"{request.phase}.stdout.log"
         stderr_path = self.log_dir / f"{request.phase}.stderr.log"
 
-        # No shell is involved (argv exec only), so a template can't use `<` to
-        # redirect a file into stdin. Pipe the combined prompt directly instead —
-        # this is the only way a CLI that reads its prompt from stdin (rather
-        # than a positional argument) can receive it.
+        # No shell is involved, so a template can't use `<` to redirect a file
+        # into stdin. Pipe the combined prompt directly instead — this is the
+        # only way a CLI that reads its prompt from stdin (rather than a
+        # positional argument) can receive it.
         with (
             stdout_path.open("w") as out,
             stderr_path.open("w") as err,
