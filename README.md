@@ -125,6 +125,14 @@ ai-factory review <run-id>       # optional Diff Review
 ai-factory resume <run-id>       # re-enter an interrupted run at its last phase
 ```
 
+## Emacs cockpit
+
+An optional Emacs frontend lives in [`emacs/ai-factory.el`](./emacs/ai-factory.el).
+It is a thin cockpit over the CLI: it lists runs, opens `plan.md`, `report.md`,
+`diff.patch`, and `pr-body.md`, and can open a run's worktree in Magit.
+
+See [`docs/emacs.md`](./docs/emacs.md) for setup and keybindings.
+
 ## What this is not
 
 Per the [v1 scope boundary](./docs/adr/0013-v1-scope-boundary.md): no push, merge,
