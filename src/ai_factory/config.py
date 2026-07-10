@@ -17,11 +17,14 @@ import os
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from .presets.registry import PRESETS as BUILTIN_PRESETS
 
 REPO_CONFIG_FILENAME = "factory.toml"
 USER_CONFIG_RELATIVE_PATH = Path("ai-factory") / "config.toml"
+
+PresetSpec = str | dict[str, Any]
 
 
 class ConfigError(RuntimeError):
@@ -34,7 +37,7 @@ class ConfigError(RuntimeError):
 class ResolvedConfig:
     backend_name: str
     backend_source: str  # "cli" | "repo_config" | "user_config" | "default"
-    presets: dict[str, str]
+    presets: dict[str, PresetSpec]
     commands: dict[str, dict]  # key -> {"command", "source", "confidence", ["config_path"]}
     risk_override: str | None
     risk_override_source: str | None  # "repo_config" | None
@@ -87,16 +90,48 @@ def _commands_section(data: dict, path: Path) -> dict[str, str]:
     return dict(commands)
 
 
-def _user_presets(data: dict, path: Path) -> dict[str, str]:
+def _validate_preset_spec(name: str, spec: object, path: Path) -> PresetSpec:
+    if isinstance(spec, str):
+        return spec
+
+    if not isinstance(spec, dict):
+        raise ConfigError(
+            f"'{path}': [presets].{name} must be either a string command template "
+            "or a table with `argv = [...]` / `command = ...`"
+        )
+
+    if "argv" in spec:
+        argv = spec["argv"]
+        if not isinstance(argv, list) or not all(isinstance(token, str) for token in argv):
+            raise ConfigError(f"'{path}': [presets].{name}.argv must be a list of strings")
+        return {"argv": list(argv)}
+
+    if "command" in spec:
+        command = spec["command"]
+        if not isinstance(command, str):
+            raise ConfigError(f"'{path}': [presets].{name}.command must be a string")
+        return {"command": command}
+
+    raise ConfigError(
+        f"'{path}': [presets].{name} must define either `argv = [...]` or `command = ...`"
+    )
+
+
+def _user_presets(data: dict, path: Path) -> dict[str, PresetSpec]:
     presets = data.get("presets")
     if presets is None:
         return {}
     if not isinstance(presets, dict):
         raise ConfigError(f"'{path}': [presets] must be a table")
-    for name, template in presets.items():
-        if not isinstance(template, str):
-            raise ConfigError(f"'{path}': [presets].{name} must be a string command template")
-    return dict(presets)
+    return {name: _validate_preset_spec(name, spec, path) for name, spec in presets.items()}
+
+
+def _reject_repo_presets(data: dict, path: Path) -> None:
+    if "presets" in data:
+        raise ConfigError(
+            f"repo config '{path}' may not define [presets]; backend command "
+            "templates come only from user config or built-ins (ADR-0006/0008)"
+        )
 
 
 def load_config(target_repo: Path, cli_backend: str | None = None) -> ResolvedConfig:
@@ -113,6 +148,7 @@ def load_config(target_repo: Path, cli_backend: str | None = None) -> ResolvedCo
 
     repo_path = Path(target_repo) / REPO_CONFIG_FILENAME
     repo_data = _load_toml(repo_path)
+    _reject_repo_presets(repo_data, repo_path)
     repo_backend = _backend_section(repo_data, repo_path, allow_template=False)
     repo_commands = _commands_section(repo_data, repo_path)
     repo_risk = repo_data.get("risk")
