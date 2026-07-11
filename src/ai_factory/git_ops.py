@@ -115,14 +115,32 @@ def branch_exists(target_repo: Path, branch: str) -> bool:
     )
 
 
+def registered_worktree_branch(target_repo: Path, worktree_path: Path) -> str | None:
+    """Return the branch registered for ``worktree_path`` in ``target_repo``.
+
+    ``None`` means the path is not one of that repository's linked worktrees.
+    This lets cleanup verify ownership before any forced removal.
+    """
+    result = _run(["worktree", "list", "--porcelain"], cwd=target_repo, check=False)
+    current_path: Path | None = None
+    for line in [*result.stdout.splitlines(), ""]:
+        if line.startswith("worktree "):
+            current_path = Path(line.removeprefix("worktree ")).resolve()
+        elif line.startswith("branch ") and current_path == worktree_path.resolve():
+            return line.removeprefix("branch refs/heads/")
+        elif not line:
+            current_path = None
+    return None
+
+
 def remove_worktree(target_repo: Path, worktree_path: Path) -> None:
     """Remove a factory-owned worktree. `--force` is safe here: the worktree only
     ever holds factory-committed changes (see `commit_worktree_changes`), never the
     target's main working tree."""
-    _run(["worktree", "remove", "--force", str(worktree_path)], cwd=target_repo, check=False)
+    _run(["worktree", "remove", "--force", str(worktree_path)], cwd=target_repo)
 
 
 def delete_branch(target_repo: Path, branch: str) -> None:
     """Force-delete a factory-owned `factory/<run-id>` branch (never merged, so
     plain `-d` would refuse)."""
-    _run(["branch", "-D", branch], cwd=target_repo, check=False)
+    _run(["branch", "-D", branch], cwd=target_repo)

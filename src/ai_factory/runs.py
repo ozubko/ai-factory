@@ -1,6 +1,6 @@
 """Run listing and status (ADR-0011, ADR-0012, CONTEXT.md: Run, Run Outcome,
-State Dir). Runs are durable — this module only reads what `runner.py` wrote;
-it never mutates or deletes (see `cleanup.py` for that)."""
+State Dir). Runs are durable — this module only resolves and reads Run state;
+it never mutates or deletes it (see `run_artifacts.py` and `cleanup.py`)."""
 
 from __future__ import annotations
 
@@ -12,12 +12,31 @@ class RunNotFoundError(RuntimeError):
     pass
 
 
+class InvalidRunIdError(RunNotFoundError):
+    """Raised when a Run ID could escape the State Dir's runs directory."""
+
+
 def runs_dir(state_dir: Path) -> Path:
     return state_dir / "runs"
 
 
 def run_dir(state_dir: Path, run_id: str) -> Path:
-    return runs_dir(state_dir) / run_id
+    directory = runs_dir(state_dir).resolve()
+    raw_path = Path(run_id)
+    unresolved = directory / run_id
+    candidate = unresolved.resolve()
+    is_single_name = (
+        bool(run_id)
+        and not raw_path.is_absolute()
+        and raw_path.name == run_id
+        and "/" not in run_id
+        and "\\" not in run_id
+    )
+    if not is_single_name or candidate != unresolved or candidate.parent != directory:
+        raise InvalidRunIdError(
+            f"invalid run id '{run_id}': expected one directory name under {directory}"
+        )
+    return candidate
 
 
 def load_run_metadata(state_dir: Path, run_id: str) -> dict:
