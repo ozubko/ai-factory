@@ -6,34 +6,28 @@ the Planning Agent), runs the read-only `plan` Phase (ADR-0004/0010) and
 enforces it via git afterwards, recomputes the authoritative post-plan Risk
 Level (now also informed by plan-predicted changed files), applies the
 Decision Gate, and -- only when the gate permits -- runs the `implement`
-Phase, the factory-owned Verification Gate, and a bounded Fix Loop when the
-gate fails (ADR-0005, ADR-0007, ADR-0011, ADR-0014). `[review]` lands in a
-later issue.
+   Phase, the factory-owned Verification Gate, a bounded Fix Loop when the gate
+   fails, and the optional read-only Diff Review (ADR-0005, ADR-0007, ADR-0011,
+   ADR-0014).
 """
 
 from __future__ import annotations
 
 import datetime
-import json
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from . import config, decision_gate, git_ops, profiling, prompt_builder, prompts, risk, runs, safety
-from .backend.base import AgentRequest, AgentResult
+from . import config, decision_gate, git_ops, profiling, risk, runs
 from .backend.subprocess_backend import SubprocessBackend
-from .pr_body import render_pr_body
-from .report import render_report
+from .phase_runner import PhaseRunner, write_prompt_bundle
+from .run_artifacts import RunArtifacts
 from .run_id import generate_run_id
 from .state_dir import resolve_state_dir
-from .verify import VerificationResult, run_verification
 
 # Default bound on the Fix Loop (PRD: "default 1-2 attempts"). Not yet
 # CLI/config-overridable.
 DEFAULT_MAX_FIX_ATTEMPTS = 2
-
-# Tail of a failing command's log fed to the Fix Loop prompt, to keep the Prompt
-# Bundle bounded even if the command produced a huge log.
-MAX_FAILURE_EXCERPT_CHARS = 2000
 
 _NOT_EXECUTED_HALTED = {
     "status": "not_executed",
@@ -112,388 +106,89 @@ def _load_config(repo_path: Path, cli_backend: str | None) -> config.ResolvedCon
         raise RunError(str(exc)) from exc
 
 
-def _write_prompt_bundle(
-    bundle_dir: Path,
-    phase: str,
+@dataclass(frozen=True)
+class _AutomationRun:
+    """The stable resources shared by every automated lifecycle path."""
+
+    target_repo: Path
+    state_dir: Path
+    run_id: str
+    run_dir: Path
+    started_at: str
+    base_ref: str
+    base_sha: str
+    branch: str
+    worktree_path: Path
+    profile: dict
+    phase_runner: PhaseRunner
+    artifacts: RunArtifacts
+
+
+def _validate_automation_target(target_repo: Path) -> None:
+    if not git_ops.is_git_repo(target_repo):
+        raise RunError(f"target '{target_repo}' is not a git repository")
+    if not git_ops.has_commits(target_repo):
+        raise RunError(
+            f"target '{target_repo}' has no commits; automation requires at least "
+            "one commit to pin a Base Ref"
+        )
+    if not git_ops.is_clean(target_repo):
+        raise RunError(
+            f"target '{target_repo}' has a dirty working tree; commit or stash "
+            "your changes before running automation (the Factory never stashes, "
+            "resets, or copies the target working tree for you)"
+        )
+
+
+def _prepare_automation_run(
+    target_repo: Path,
     task: str,
-    profile: dict,
-    worktree_path: Path,
-    extra_context: str | None = None,
-) -> tuple[Path, Path, Path]:
-    bundle_dir.mkdir(parents=True, exist_ok=True)
+    backend_name: str,
+    state_dir_value: str | None,
+    resolved_config: config.ResolvedConfig,
+) -> _AutomationRun:
+    """Validate and create the isolated resources shared by plan/run."""
+    if backend_name not in resolved_config.presets:
+        raise RunError(
+            f"unknown backend '{backend_name}'; available: "
+            f"{sorted(resolved_config.presets)}"
+        )
 
-    system_text = prompts.SYSTEM_PROMPTS[phase]
-    user_text = prompt_builder.build_user_prompt(
-        phase, task, profile, worktree_path, extra_context
-    )
-    combined_text = f"{system_text}\n\n{user_text}"
+    _validate_automation_target(target_repo)
+    state_dir = resolve_state_dir(state_dir_value)
+    run_id = generate_run_id(task)
+    run_dir = state_dir / "runs" / run_id
+    if run_dir.exists():
+        raise RunError(f"run id collision: '{run_id}' already exists at {run_dir}")
+    run_dir.mkdir(parents=True)
 
-    system_path = bundle_dir / f"{phase}-system.md"
-    user_path = bundle_dir / f"{phase}-user.md"
-    combined_path = bundle_dir / f"{phase}-combined.md"
-    system_path.write_text(system_text)
-    user_path.write_text(user_text)
-    combined_path.write_text(combined_text)
-    return system_path, user_path, combined_path
-
-
-def _run_agent_phase(
-    backend: SubprocessBackend,
-    bundle_dir: Path,
-    worktree_path: Path,
-    phase: str,
-    task: str,
-    profile: dict,
-    output_path: Path,
-    mode: str,
-    extra_context: str | None = None,
-) -> tuple[AgentResult, str, str]:
-    system_path, user_path, combined_path = _write_prompt_bundle(
-        bundle_dir, phase, task, profile, worktree_path, extra_context
-    )
-    request = AgentRequest(
-        phase=phase,
-        workdir=worktree_path,
-        system_prompt_path=system_path,
-        user_prompt_path=user_path,
-        combined_prompt_path=combined_path,
-        output_path=output_path,
-        mode=mode,
-    )
     started_at = _now()
-    result = backend.run(request)
-    finished_at = _now()
-    return result, started_at, finished_at
+    base_ref = "HEAD"
+    base_sha = git_ops.resolve_sha(target_repo, base_ref)
+    branch = f"factory/{run_id}"
+    worktree_path = run_dir / "worktree"
+    git_ops.add_worktree(target_repo, worktree_path, branch, base_sha)
 
-
-def _verify_result_to_dict(verify_result: VerificationResult) -> dict:
-    return {
-        "degraded": verify_result.degraded,
-        "passed": verify_result.passed,
-        "commands": [
-            {
-                "key": result.key,
-                "command": result.command,
-                "exit_code": result.exit_code,
-                "passed": result.passed,
-                "log_path": str(result.log_path),
-            }
-            for result in verify_result.results
-        ],
-    }
-
-
-def _failure_excerpt(result: VerificationResult) -> str:
-    failing = next(r for r in result.results if not r.passed)
-    log_text = failing.log_path.read_text()[-MAX_FAILURE_EXCERPT_CHARS:]
-    return (
-        f"Command `{failing.command}` (key: {failing.key}) failed with exit "
-        f"code {failing.exit_code}:\n\n{log_text}"
+    profile = config.merge_profile_commands(
+        profiling.build_profile(worktree_path), resolved_config
     )
-
-
-def _run_plan_phase(
-    backend: SubprocessBackend,
-    bundle_dir: Path,
-    run_dir: Path,
-    worktree_path: Path,
-    task: str,
-    profile: dict,
-    extra_context: str | None = None,
-) -> tuple[dict, dict, dict, str | None, str | None]:
-    """Runs the read-only `plan` Phase and enforces it via git afterwards.
-
-    Returns `(plan_phase, implement_placeholder, verify_placeholder,
-    outcome, outcome_reason)`. `outcome`/`outcome_reason` are set (and the two
-    placeholders are `not_executed`) only on a Contract Violation or a plan
-    Phase failure, signalling the caller to halt before `implement`.
-    """
-    plan_path = run_dir / "plan.md"
-    plan_result, started_at, finished_at = _run_agent_phase(
-        backend,
-        bundle_dir,
-        worktree_path,
-        "plan",
-        task,
-        profile,
-        output_path=plan_path,
-        mode="read_only",
-        extra_context=extra_context,
+    backend = SubprocessBackend(
+        resolved_config.presets[backend_name], log_dir=run_dir / "logs"
     )
-
-    if not git_ops.is_clean(worktree_path):
-        (run_dir / "contract-violation.patch").write_text(
-            git_ops.uncommitted_diff(worktree_path)
-        )
-        violation_files = git_ops.uncommitted_changed_files(worktree_path)
-        (run_dir / "contract-violation-files.txt").write_text(
-            "\n".join(violation_files) + ("\n" if violation_files else "")
-        )
-        plan_phase = {
-            "status": "contract_violation",
-            "reason": (
-                "the read-only plan Phase modified the worktree; evidence "
-                "saved to contract-violation.patch"
-            ),
-            "started_at": started_at,
-            "finished_at": finished_at,
-            "exit_code": plan_result.exit_code,
-            "summary": plan_result.summary,
-        }
-        outcome_reason = (
-            "the read-only plan Phase modified the worktree "
-            "(see contract-violation.patch)"
-        )
-        return (
-            plan_phase,
-            dict(_NOT_EXECUTED_HALTED),
-            dict(_NOT_EXECUTED_HALTED),
-            "contract_violation",
-            outcome_reason,
-        )
-
-    if plan_result.exit_code != 0:
-        plan_phase = {
-            "status": "failed",
-            "reason": f"plan phase exited {plan_result.exit_code}",
-            "started_at": started_at,
-            "finished_at": finished_at,
-            "exit_code": plan_result.exit_code,
-            "summary": plan_result.summary,
-        }
-        outcome_reason = f"plan phase exited {plan_result.exit_code}"
-        return plan_phase, dict(_NOT_EXECUTED_HALTED), dict(_NOT_EXECUTED_HALTED), "failed", outcome_reason
-
-    plan_text = plan_path.read_text() if plan_path.exists() else ""
-    missing_headings = prompts.missing_plan_headings(plan_text)
-    plan_phase = {
-        "status": "succeeded",
-        "reason": None,
-        "started_at": started_at,
-        "finished_at": finished_at,
-        "exit_code": plan_result.exit_code,
-        "summary": plan_result.summary,
-        "plan_quality": "degraded" if missing_headings else "ok",
-        "missing_headings": missing_headings,
-    }
-    return plan_phase, {}, {}, None, None
-
-
-def _run_implement_and_verify(
-    backend: SubprocessBackend,
-    bundle_dir: Path,
-    run_dir: Path,
-    worktree_path: Path,
-    task: str,
-    profile: dict,
-    max_fix_attempts: int,
-) -> tuple[dict, dict, list[dict], str, str, bool]:
-    """Runs `implement`, commits the worktree, then the factory-owned
-    Verification Gate and a bounded Fix Loop when it fails (ADR-0005/0011).
-    Returns `(implement_phase, verify_phase, fix_attempts, outcome,
-    outcome_reason, verify_gate_errored)`. Shared by Automation Mode (`run`)
-    and the staged `implement` command so both drive identical behavior."""
-    implement_result, implement_started_at, implement_finished_at = _run_agent_phase(
-        backend,
-        bundle_dir,
-        worktree_path,
-        "implement",
-        task,
-        profile,
-        output_path=run_dir / "implement-output.md",
-        mode="read_write",
+    return _AutomationRun(
+        target_repo=target_repo,
+        state_dir=state_dir,
+        run_id=run_id,
+        run_dir=run_dir,
+        started_at=started_at,
+        base_ref=base_ref,
+        base_sha=base_sha,
+        branch=branch,
+        worktree_path=worktree_path,
+        profile=profile,
+        phase_runner=PhaseRunner(backend, run_dir, worktree_path, task, profile),
+        artifacts=RunArtifacts(run_dir),
     )
-    git_ops.commit_worktree_changes(worktree_path, message=f"implement: {task}")
-    implement_status = "succeeded" if implement_result.exit_code == 0 else "failed"
-    implement_phase = {
-        "status": implement_status,
-        "reason": (
-            None
-            if implement_status == "succeeded"
-            else f"implement phase exited {implement_result.exit_code}"
-        ),
-        "started_at": implement_started_at,
-        "finished_at": implement_finished_at,
-        "exit_code": implement_result.exit_code,
-        "summary": implement_result.summary,
-    }
-
-    fix_attempts: list[dict] = []
-
-    if implement_status != "succeeded":
-        outcome = "failed"
-        outcome_reason = f"implement phase exited {implement_result.exit_code}"
-        verify_phase = {
-            "status": "not_executed",
-            "reason": "implement phase failed; the Verification Gate did not run",
-            "started_at": None,
-            "finished_at": None,
-        }
-        return implement_phase, verify_phase, fix_attempts, outcome, outcome_reason, False
-
-    verify_started_at = _now()
-    try:
-        verify_result = run_verification(
-            worktree_path, profile["commands"], run_dir / "verify" / "attempt-0"
-        )
-    except safety.DeniedCommandError as exc:
-        outcome = "failed"
-        outcome_reason = str(exc)
-        verify_phase = {
-            "status": "failed",
-            "reason": outcome_reason,
-            "started_at": verify_started_at,
-            "finished_at": _now(),
-        }
-        return implement_phase, verify_phase, fix_attempts, outcome, outcome_reason, True
-
-    if verify_result.degraded:
-        outcome = "implemented_degraded"
-        outcome_reason = "no Verification Gate commands detected (degraded mode)"
-        verify_phase = {
-            "status": "skipped",
-            "reason": "no verification commands detected -- degraded mode (ADR-0005)",
-            "started_at": verify_started_at,
-            "finished_at": _now(),
-            **_verify_result_to_dict(verify_result),
-        }
-        return implement_phase, verify_phase, fix_attempts, outcome, outcome_reason, False
-
-    if verify_result.passed:
-        outcome = "implemented_verified"
-        outcome_reason = "Verification Gate passed"
-        verify_phase = {
-            "status": "succeeded",
-            "reason": None,
-            "started_at": verify_started_at,
-            "finished_at": _now(),
-            **_verify_result_to_dict(verify_result),
-        }
-        return implement_phase, verify_phase, fix_attempts, outcome, outcome_reason, False
-
-    current = verify_result
-    for attempt_num in range(1, max_fix_attempts + 1):
-        extra_context = _failure_excerpt(current)
-        fix_result, fix_started_at, fix_finished_at = _run_agent_phase(
-            backend,
-            bundle_dir,
-            worktree_path,
-            "fix",
-            task,
-            profile,
-            output_path=run_dir / "fix-output.md",
-            mode="read_write",
-            extra_context=extra_context,
-        )
-        git_ops.commit_worktree_changes(
-            worktree_path, message=f"fix attempt {attempt_num}: {task}"
-        )
-        current = run_verification(
-            worktree_path, profile["commands"], run_dir / "verify" / f"attempt-{attempt_num}"
-        )
-        fix_attempts.append(
-            {
-                "attempt": attempt_num,
-                "phase_status": "succeeded" if fix_result.exit_code == 0 else "failed",
-                "exit_code": fix_result.exit_code,
-                "summary": fix_result.summary,
-                "started_at": fix_started_at,
-                "finished_at": fix_finished_at,
-                "verify": _verify_result_to_dict(current),
-            }
-        )
-        if current.passed:
-            break
-
-    if current.passed:
-        outcome = "implemented_verified"
-        outcome_reason = f"Verification Gate passed after {len(fix_attempts)} Fix Loop attempt(s)"
-        verify_status = "succeeded"
-    else:
-        outcome = "implemented_unverified"
-        outcome_reason = (
-            "Verification Gate failed after exhausting the Fix Loop "
-            f"({len(fix_attempts)} attempt(s))"
-        )
-        verify_status = "failed"
-
-    verify_phase = {
-        "status": verify_status,
-        "reason": outcome_reason,
-        "started_at": verify_started_at,
-        "finished_at": _now(),
-        **_verify_result_to_dict(current),
-    }
-    return implement_phase, verify_phase, fix_attempts, outcome, outcome_reason, False
-
-
-def _run_review(
-    backend: SubprocessBackend,
-    bundle_dir: Path,
-    run_dir: Path,
-    worktree_path: Path,
-    task: str,
-    profile: dict,
-    base_sha: str,
-) -> tuple[dict, str | None, str | None]:
-    """Runs the read-only Diff Review Phase (opt-in via `--review`, or via the
-    staged `review` command). Returns `(review_phase, outcome_override,
-    outcome_reason_override)`; the overrides are non-`None` only on a Contract
-    Violation, signalling the caller to override its own outcome."""
-    review_started_at = _now()
-    review_context = (
-        "## Diff to review\n\n```diff\n"
-        + git_ops.diff_against_base(worktree_path, base_sha)
-        + "\n```\n"
-    )
-    review_result, _, review_finished_at = _run_agent_phase(
-        backend,
-        bundle_dir,
-        worktree_path,
-        "review",
-        task,
-        profile,
-        output_path=run_dir / "review-output.md",
-        mode="read_only",
-        extra_context=review_context,
-    )
-    if not git_ops.is_clean(worktree_path):
-        (run_dir / "contract-violation.patch").write_text(
-            git_ops.uncommitted_diff(worktree_path)
-        )
-        violation_files = git_ops.uncommitted_changed_files(worktree_path)
-        (run_dir / "contract-violation-files.txt").write_text(
-            "\n".join(violation_files) + ("\n" if violation_files else "")
-        )
-        outcome_reason = (
-            "the read-only review Phase modified the worktree (see contract-violation.patch)"
-        )
-        review_phase = {
-            "status": "contract_violation",
-            "reason": outcome_reason,
-            "started_at": review_started_at,
-            "finished_at": review_finished_at,
-            "exit_code": review_result.exit_code,
-            "summary": review_result.summary,
-        }
-        return review_phase, "contract_violation", outcome_reason
-
-    review_path = run_dir / "review-output.md"
-    review_text = review_path.read_text() if review_path.exists() else ""
-    review_phase = {
-        "status": "succeeded" if review_result.exit_code == 0 else "failed",
-        "reason": (
-            None
-            if review_result.exit_code == 0
-            else f"review phase exited {review_result.exit_code}"
-        ),
-        "started_at": review_started_at,
-        "finished_at": review_finished_at,
-        "exit_code": review_result.exit_code,
-        "summary": review_result.summary,
-        "findings": review_text,
-    }
-    return review_phase, None, None
 
 
 def run_manual(target: str, task: str, state_dir_value: str | None) -> int:
@@ -513,6 +208,7 @@ def run_manual(target: str, task: str, state_dir_value: str | None) -> int:
     if run_dir.exists():
         raise RunError(f"run id collision: '{run_id}' already exists at {run_dir}")
     run_dir.mkdir(parents=True)
+    artifacts = RunArtifacts(run_dir)
 
     started_at = _now()
     branch = f"factory/{run_id}"
@@ -520,10 +216,12 @@ def run_manual(target: str, task: str, state_dir_value: str | None) -> int:
     bundle_dir = run_dir / "bundles"
 
     resolved_config = _load_config(target_repo, cli_backend="manual")
-    profile = config.merge_profile_commands(profiling.build_profile(target_repo), resolved_config)
+    profile = config.merge_profile_commands(
+        profiling.build_profile(target_repo), resolved_config
+    )
     pre_plan_level, pre_plan_reasons = risk.classify(task, profile)
     plan_extra_context = risk.render_pre_plan_context(pre_plan_level, pre_plan_reasons)
-    system_path, user_path, combined_path = _write_prompt_bundle(
+    system_path, user_path, combined_path = write_prompt_bundle(
         bundle_dir, "plan", task, profile, target_repo, plan_extra_context
     )
 
@@ -588,10 +286,8 @@ def run_manual(target: str, task: str, state_dir_value: str | None) -> int:
         "outcome": outcome,
         "outcome_reason": outcome_reason,
     }
-    (run_dir / "profile.json").write_text(json.dumps(profile, indent=2) + "\n")
-    (run_dir / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n")
-    (run_dir / "report.md").write_text(render_report(metadata))
-    (run_dir / "pr-body.md").write_text(render_pr_body(metadata))
+    artifacts.write_profile(profile)
+    artifacts.publish(metadata)
     return 0
 
 
@@ -614,61 +310,23 @@ def plan_task(
 
     target_repo = Path(target).resolve()
     resolved_config = _load_config(target_repo, cli_backend=backend_name)
-    if backend_name not in resolved_config.presets:
-        raise RunError(
-            f"unknown backend '{backend_name}'; available: {sorted(resolved_config.presets)}"
-        )
-
-    if not git_ops.is_git_repo(target_repo):
-        raise RunError(f"target '{target_repo}' is not a git repository")
-    if not git_ops.has_commits(target_repo):
-        raise RunError(
-            f"target '{target_repo}' has no commits; automation requires at least "
-            "one commit to pin a Base Ref"
-        )
-    if not git_ops.is_clean(target_repo):
-        raise RunError(
-            f"target '{target_repo}' has a dirty working tree; commit or stash "
-            "your changes before running automation (the Factory never stashes, "
-            "resets, or copies the target working tree for you)"
-        )
-
-    state_dir = resolve_state_dir(state_dir_value)
-    run_id = generate_run_id(task)
-    run_dir = state_dir / "runs" / run_id
-    if run_dir.exists():
-        raise RunError(f"run id collision: '{run_id}' already exists at {run_dir}")
-    run_dir.mkdir(parents=True)
-
-    started_at = _now()
-    base_ref = "HEAD"
-    base_sha = git_ops.resolve_sha(target_repo, base_ref)
-    branch = f"factory/{run_id}"
-    worktree_path = run_dir / "worktree"
-    git_ops.add_worktree(target_repo, worktree_path, branch, base_sha)
-
-    profile = config.merge_profile_commands(
-        profiling.build_profile(worktree_path), resolved_config
+    automation = _prepare_automation_run(
+        target_repo, task, backend_name, state_dir_value, resolved_config
     )
-    bundle_dir = run_dir / "bundles"
-    backend = SubprocessBackend(resolved_config.presets[backend_name], log_dir=run_dir / "logs")
+    profile = automation.profile
 
     pre_plan_level, pre_plan_reasons = risk.classify(task, profile)
     plan_extra_context = risk.render_pre_plan_context(pre_plan_level, pre_plan_reasons)
 
-    plan_phase, implement_placeholder, verify_placeholder, halt_outcome, halt_reason = (
-        _run_plan_phase(
-            backend, bundle_dir, run_dir, worktree_path, task, profile, plan_extra_context
-        )
-    )
-    phases: dict[str, dict] = {"plan": plan_phase}
+    plan_execution = automation.phase_runner.run_plan(plan_extra_context)
+    phases: dict[str, dict] = {"plan": plan_execution.phase}
 
-    if halt_outcome is not None:
-        phases["implement"] = implement_placeholder
-        phases["verify"] = verify_placeholder
+    if plan_execution.halted:
+        phases["implement"] = dict(_NOT_EXECUTED_HALTED)
+        phases["verify"] = dict(_NOT_EXECUTED_HALTED)
         phases["review"] = dict(_NOT_EXECUTED_REVIEW)
-        outcome = halt_outcome
-        outcome_reason = halt_reason
+        outcome = plan_execution.outcome
+        outcome_reason = plan_execution.outcome_reason
         risk_result = {
             "level": pre_plan_level,
             "reasons": pre_plan_reasons,
@@ -681,7 +339,8 @@ def plan_task(
             "force_implement_used": False,
         }
     else:
-        plan_text = (run_dir / "plan.md").read_text() if (run_dir / "plan.md").exists() else ""
+        plan_path = automation.run_dir / "plan.md"
+        plan_text = plan_path.read_text() if plan_path.exists() else ""
         predicted_files = risk.extract_predicted_files(plan_text)
         final_level, final_reasons = risk.classify(task, profile, predicted_files)
         risk_result = {
@@ -692,8 +351,8 @@ def plan_task(
         }
         outcome = "planned"
         outcome_reason = (
-            f"staged plan Phase completed (run '{run_id}'); inspect plan.md, then "
-            f"run `ai-factory implement {run_id}` to continue"
+            f"staged plan Phase completed (run '{automation.run_id}'); inspect "
+            f"plan.md, then run `ai-factory implement {automation.run_id}` to continue"
         )
         gate_info = {
             "paused": True,
@@ -704,25 +363,22 @@ def plan_task(
         phases["verify"] = dict(_NOT_EXECUTED_STAGED_IMPLEMENT)
         phases["review"] = dict(_NOT_EXECUTED_STAGED_REVIEW)
 
-    diff_text = git_ops.diff_against_base(worktree_path, base_sha)
-    files_changed = git_ops.changed_files(worktree_path, base_sha)
-    (run_dir / "diff.patch").write_text(diff_text)
-    (run_dir / "changed-files.txt").write_text(
-        "\n".join(files_changed) + ("\n" if files_changed else "")
+    files_changed = automation.artifacts.capture_changes(
+        automation.worktree_path, automation.base_sha
     )
 
     finished_at = _now()
     metadata = {
-        "run_id": run_id,
+        "run_id": automation.run_id,
         "task": task,
-        "target_repo": str(target_repo),
+        "target_repo": str(automation.target_repo),
         "backend": backend_name,
-        "base_ref": base_ref,
-        "base_sha": base_sha,
-        "branch": branch,
-        "worktree_path": str(worktree_path),
-        "state_dir": str(state_dir),
-        "started_at": started_at,
+        "base_ref": automation.base_ref,
+        "base_sha": automation.base_sha,
+        "branch": automation.branch,
+        "worktree_path": str(automation.worktree_path),
+        "state_dir": str(automation.state_dir),
+        "started_at": automation.started_at,
         "finished_at": finished_at,
         "changed_files": files_changed,
         "phases": phases,
@@ -742,11 +398,9 @@ def plan_task(
         "outcome": outcome,
         "outcome_reason": outcome_reason,
     }
-    (run_dir / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n")
-    (run_dir / "report.md").write_text(render_report(metadata))
-    (run_dir / "pr-body.md").write_text(render_pr_body(metadata))
+    automation.artifacts.publish(metadata)
 
-    print(f"Run ID: {run_id}")
+    print(f"Run ID: {automation.run_id}")
     print(f"Outcome: {outcome} -- {outcome_reason}")
     return 0 if outcome == "planned" else 1
 
@@ -776,9 +430,9 @@ def _continue_implement(
     then persists the result. Callers are responsible for validating Phase
     statuses and worktree cleanliness before calling this."""
     worktree_path = Path(metadata["worktree_path"])
+    artifacts = RunArtifacts(run_dir)
     task = metadata["task"]
     base_sha = metadata["base_sha"]
-    bundle_dir = run_dir / "bundles"
     resolved_config = _load_config(worktree_path, cli_backend=metadata["backend"])
     backend = SubprocessBackend(
         resolved_config.presets[metadata["backend"]], log_dir=run_dir / "logs"
@@ -786,25 +440,27 @@ def _continue_implement(
     profile = config.merge_profile_commands(
         profiling.build_profile(worktree_path), resolved_config
     )
+    phase_runner = PhaseRunner(backend, run_dir, worktree_path, task, profile)
 
-    implement_phase, verify_phase, fix_attempts, outcome, outcome_reason, verify_gate_errored = (
-        _run_implement_and_verify(
-            backend, bundle_dir, run_dir, worktree_path, task, profile, max_fix_attempts
-        )
-    )
-    metadata["phases"]["implement"] = implement_phase
-    metadata["phases"]["verify"] = verify_phase
-    metadata["fix_loop"] = {"max_attempts": max_fix_attempts, "attempts": fix_attempts}
+    implementation = phase_runner.run_implementation(max_fix_attempts)
+    outcome = implementation.outcome
+    outcome_reason = implementation.outcome_reason
+    metadata["phases"]["implement"] = implementation.implement_phase
+    metadata["phases"]["verify"] = implementation.verify_phase
+    metadata["fix_loop"] = {
+        "max_attempts": max_fix_attempts,
+        "attempts": implementation.fix_attempts,
+    }
 
-    if not verify_gate_errored:
+    if not implementation.verification_errored:
         if review:
-            review_phase, outcome_override, outcome_reason_override = _run_review(
-                backend, bundle_dir, run_dir, worktree_path, task, profile, base_sha
-            )
-            metadata["phases"]["review"] = review_phase
-            if outcome_override is not None:
-                outcome = outcome_override
-                outcome_reason = outcome_reason_override or outcome_reason
+            review_execution = phase_runner.run_review(base_sha)
+            metadata["phases"]["review"] = review_execution.phase
+            if review_execution.outcome_override is not None:
+                outcome = review_execution.outcome_override
+                outcome_reason = (
+                    review_execution.outcome_reason_override or outcome_reason
+                )
         else:
             metadata["phases"]["review"] = dict(_NOT_EXECUTED_STAGED_REVIEW)
 
@@ -812,20 +468,13 @@ def _continue_implement(
     metadata["decision_gate"]["reason"] = decision_gate_reason
     metadata["decision_gate"]["flags"]["review"] = review
 
-    diff_text = git_ops.diff_against_base(worktree_path, base_sha)
-    files_changed = git_ops.changed_files(worktree_path, base_sha)
-    (run_dir / "diff.patch").write_text(diff_text)
-    (run_dir / "changed-files.txt").write_text(
-        "\n".join(files_changed) + ("\n" if files_changed else "")
-    )
+    files_changed = artifacts.capture_changes(worktree_path, base_sha)
     metadata["changed_files"] = files_changed
     metadata["finished_at"] = _now()
     metadata["outcome"] = outcome
     metadata["outcome_reason"] = outcome_reason
 
-    (run_dir / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n")
-    (run_dir / "report.md").write_text(render_report(metadata))
-    (run_dir / "pr-body.md").write_text(render_pr_body(metadata))
+    artifacts.publish(metadata)
 
     print(f"Run ID: {run_id}")
     print(f"Outcome: {outcome} -- {outcome_reason}")
@@ -874,9 +523,9 @@ def _continue_review(run_id: str, run_dir: Path, metadata: dict) -> int:
     `metadata`, then persists the result. Callers are responsible for
     validating Phase statuses and worktree cleanliness before calling this."""
     worktree_path = Path(metadata["worktree_path"])
+    artifacts = RunArtifacts(run_dir)
     task = metadata["task"]
     base_sha = metadata["base_sha"]
-    bundle_dir = run_dir / "bundles"
     resolved_config = _load_config(worktree_path, cli_backend=metadata["backend"])
     backend = SubprocessBackend(
         resolved_config.presets[metadata["backend"]], log_dir=run_dir / "logs"
@@ -884,24 +533,21 @@ def _continue_review(run_id: str, run_dir: Path, metadata: dict) -> int:
     profile = config.merge_profile_commands(
         profiling.build_profile(worktree_path), resolved_config
     )
+    phase_runner = PhaseRunner(backend, run_dir, worktree_path, task, profile)
 
-    review_phase, outcome_override, outcome_reason_override = _run_review(
-        backend, bundle_dir, run_dir, worktree_path, task, profile, base_sha
-    )
-    metadata["phases"]["review"] = review_phase
+    review_execution = phase_runner.run_review(base_sha)
+    metadata["phases"]["review"] = review_execution.phase
     metadata["decision_gate"]["flags"]["review"] = True
-    if outcome_override is not None:
-        metadata["outcome"] = outcome_override
-        metadata["outcome_reason"] = outcome_reason_override
+    if review_execution.outcome_override is not None:
+        metadata["outcome"] = review_execution.outcome_override
+        metadata["outcome_reason"] = review_execution.outcome_reason_override
     metadata["finished_at"] = _now()
 
-    (run_dir / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n")
-    (run_dir / "report.md").write_text(render_report(metadata))
-    (run_dir / "pr-body.md").write_text(render_pr_body(metadata))
+    artifacts.publish(metadata)
 
     print(f"Run ID: {run_id}")
-    print(f"Review status: {review_phase['status']}")
-    return 0 if review_phase["status"] in ("succeeded",) else 1
+    print(f"Review status: {review_execution.phase['status']}")
+    return 0 if review_execution.phase["status"] in ("succeeded",) else 1
 
 
 def review_task(run_id: str, state_dir_value: str | None) -> int:
@@ -940,7 +586,9 @@ def run_task(
     review: bool = False,
 ) -> int:
     if risk_override is not None and risk_override not in ("low", "medium", "high"):
-        raise RunError(f"invalid --risk override '{risk_override}'; must be low, medium, or high")
+        raise RunError(
+            f"invalid --risk override '{risk_override}'; must be low, medium, or high"
+        )
 
     target_repo = Path(target).resolve()
     resolved_config = _load_config(target_repo, cli_backend=backend_name)
@@ -950,50 +598,10 @@ def run_task(
 
     if backend_name == "manual":
         return run_manual(target, task, state_dir_value)
-    if backend_name not in resolved_config.presets:
-        raise RunError(
-            f"unknown backend '{backend_name}'; available: {sorted(resolved_config.presets)}"
-        )
-
-    if not git_ops.is_git_repo(target_repo):
-        raise RunError(f"target '{target_repo}' is not a git repository")
-    if not git_ops.has_commits(target_repo):
-        raise RunError(
-            f"target '{target_repo}' has no commits; automation requires at least "
-            "one commit to pin a Base Ref"
-        )
-    if not git_ops.is_clean(target_repo):
-        raise RunError(
-            f"target '{target_repo}' has a dirty working tree; commit or stash "
-            "your changes before running automation (the Factory never stashes, "
-            "resets, or copies the target working tree for you)"
-        )
-
-    state_dir = resolve_state_dir(state_dir_value)
-    run_id = generate_run_id(task)
-    run_dir = state_dir / "runs" / run_id
-    if run_dir.exists():
-        raise RunError(f"run id collision: '{run_id}' already exists at {run_dir}")
-    run_dir.mkdir(parents=True)
-
-    started_at = _now()
-    base_ref = "HEAD"
-    base_sha = git_ops.resolve_sha(target_repo, base_ref)
-    branch = f"factory/{run_id}"
-    worktree_path = run_dir / "worktree"
-
-    git_ops.add_worktree(target_repo, worktree_path, branch, base_sha)
-
-    # Built once, up front: the plan Phase needs the Repo Profile as an input
-    # (PRD story 20), and the same profile is reused for the Verification Gate
-    # below so it is never re-derived mid-Run. Repo/user config commands are
-    # layered on top (ADR-0008) with repo config taking precedence.
-    profile = config.merge_profile_commands(
-        profiling.build_profile(worktree_path), resolved_config
+    automation = _prepare_automation_run(
+        target_repo, task, backend_name, state_dir_value, resolved_config
     )
-
-    bundle_dir = run_dir / "bundles"
-    backend = SubprocessBackend(resolved_config.presets[backend_name], log_dir=run_dir / "logs")
+    profile = automation.profile
 
     phases: dict[str, dict] = {}
     fix_attempts: list[dict] = []
@@ -1004,18 +612,14 @@ def run_task(
     pre_plan_level, pre_plan_reasons = risk.classify(task, profile)
     plan_extra_context = risk.render_pre_plan_context(pre_plan_level, pre_plan_reasons)
 
-    plan_phase, implement_placeholder, verify_placeholder, halt_outcome, halt_reason = (
-        _run_plan_phase(
-            backend, bundle_dir, run_dir, worktree_path, task, profile, plan_extra_context
-        )
-    )
-    phases["plan"] = plan_phase
+    plan_execution = automation.phase_runner.run_plan(plan_extra_context)
+    phases["plan"] = plan_execution.phase
 
-    if halt_outcome is not None:
-        phases["implement"] = implement_placeholder
-        phases["verify"] = verify_placeholder
-        outcome = halt_outcome
-        outcome_reason = halt_reason
+    if plan_execution.halted:
+        phases["implement"] = dict(_NOT_EXECUTED_HALTED)
+        phases["verify"] = dict(_NOT_EXECUTED_HALTED)
+        outcome = plan_execution.outcome
+        outcome_reason = plan_execution.outcome_reason
         # A halted plan Phase never reaches the Decision Gate; record the
         # pre-plan classification since it is all that was ever computed.
         risk_result = {
@@ -1033,7 +637,8 @@ def run_task(
         # Decision Gate (ADR-0014): recompute the authoritative, post-plan Risk
         # Level -- now also informed by plan-predicted changed files -- then
         # decide whether automation continues into `implement`.
-        plan_text = (run_dir / "plan.md").read_text() if (run_dir / "plan.md").exists() else ""
+        plan_path = automation.run_dir / "plan.md"
+        plan_text = plan_path.read_text() if plan_path.exists() else ""
         predicted_files = risk.extract_predicted_files(plan_text)
         computed_level, computed_reasons = risk.classify(task, profile, predicted_files)
 
@@ -1068,32 +673,31 @@ def run_task(
             "force_implement_used": gate.force_implement_used,
         }
 
-    if halt_outcome is not None:
+    if plan_execution.halted:
         pass
     elif not gate_info["paused"]:
-        (
-            phases["implement"],
-            phases["verify"],
-            fix_attempts,
-            outcome,
-            outcome_reason,
-            verify_gate_errored,
-        ) = _run_implement_and_verify(
-            backend, bundle_dir, run_dir, worktree_path, task, profile, max_fix_attempts
-        )
+        implementation = automation.phase_runner.run_implementation(max_fix_attempts)
+        phases["implement"] = implementation.implement_phase
+        phases["verify"] = implementation.verify_phase
+        fix_attempts = implementation.fix_attempts
+        outcome = implementation.outcome
+        outcome_reason = implementation.outcome_reason
 
         # Diff Review (opt-in via --review, ADR-0003/0014): a read-only
         # Phase over the Run's diff, feeding findings into the report --
         # it is not an approval gate and never overrides the Verification
         # Gate's outcome, except for a Contract Violation on itself.
-        if not verify_gate_errored:
+        if not implementation.verification_errored:
             if review:
-                phases["review"], outcome_override, outcome_reason_override = _run_review(
-                    backend, bundle_dir, run_dir, worktree_path, task, profile, base_sha
+                review_execution = automation.phase_runner.run_review(
+                    automation.base_sha
                 )
-                if outcome_override is not None:
-                    outcome = outcome_override
-                    outcome_reason = outcome_reason_override or outcome_reason
+                phases["review"] = review_execution.phase
+                if review_execution.outcome_override is not None:
+                    outcome = review_execution.outcome_override
+                    outcome_reason = (
+                        review_execution.outcome_reason_override or outcome_reason
+                    )
             else:
                 phases["review"] = dict(_SKIPPED_REVIEW_NOT_REQUESTED)
     else:
@@ -1109,28 +713,27 @@ def run_task(
         # gate-paused, or implement itself failed): Diff Review never runs,
         # whether or not --review was passed.
         phases["review"] = (
-            dict(_SKIPPED_REVIEW_NOT_REQUESTED) if not review else dict(_NOT_EXECUTED_REVIEW)
+            dict(_SKIPPED_REVIEW_NOT_REQUESTED)
+            if not review
+            else dict(_NOT_EXECUTED_REVIEW)
         )
 
-    diff_text = git_ops.diff_against_base(worktree_path, base_sha)
-    files_changed = git_ops.changed_files(worktree_path, base_sha)
-    (run_dir / "diff.patch").write_text(diff_text)
-    (run_dir / "changed-files.txt").write_text(
-        "\n".join(files_changed) + ("\n" if files_changed else "")
+    files_changed = automation.artifacts.capture_changes(
+        automation.worktree_path, automation.base_sha
     )
 
     finished_at = _now()
     metadata = {
-        "run_id": run_id,
+        "run_id": automation.run_id,
         "task": task,
-        "target_repo": str(target_repo),
+        "target_repo": str(automation.target_repo),
         "backend": backend_name,
-        "base_ref": base_ref,
-        "base_sha": base_sha,
-        "branch": branch,
-        "worktree_path": str(worktree_path),
-        "state_dir": str(state_dir),
-        "started_at": started_at,
+        "base_ref": automation.base_ref,
+        "base_sha": automation.base_sha,
+        "branch": automation.branch,
+        "worktree_path": str(automation.worktree_path),
+        "state_dir": str(automation.state_dir),
+        "started_at": automation.started_at,
         "finished_at": finished_at,
         "changed_files": files_changed,
         "phases": phases,
@@ -1153,11 +756,13 @@ def run_task(
         "outcome_reason": outcome_reason,
     }
 
-    (run_dir / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n")
-    (run_dir / "report.md").write_text(render_report(metadata))
-    (run_dir / "pr-body.md").write_text(render_pr_body(metadata))
+    automation.artifacts.publish(metadata)
 
-    return 0 if outcome in ("implemented_verified", "implemented_degraded", "planned") else 1
+    return (
+        0
+        if outcome in ("implemented_verified", "implemented_degraded", "planned")
+        else 1
+    )
 
 
 def resume_task(

@@ -8,6 +8,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
+
+PhaseMode = Literal["read_only", "read_write"]
 
 
 @dataclass(frozen=True)
@@ -20,7 +23,7 @@ class AgentRequest:
     user_prompt_path: Path
     combined_prompt_path: Path
     output_path: Path
-    mode: str  # "read_only" | "read_write"
+    mode: PhaseMode
     timeout: float | None = None
 
 
